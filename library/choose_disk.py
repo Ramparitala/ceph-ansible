@@ -1,3 +1,5 @@
+# -*- encoding: utf-8 -*-
+
 #!/usr/bin/python3
 # Copyright 2017, Red Hat, Inc.
 #
@@ -17,6 +19,7 @@
 from ansible.module_utils.basic import AnsibleModule
 import logging
 import json
+import operator
 import os
 import re
 import subprocess
@@ -46,96 +49,87 @@ CEPH_META_LIST = ['data', 'journal', 'block.wal', 'block.db', 'block']
 # into the same unit (i.e to avoid comparing GB and MB)
 
 
-def _equal(left, right):
-    '''
-    Function to test equality when comparing features
-    '''
-    return to_bytes(left) == to_bytes(right)
-
-
-def _gt(left, right):
-    '''
-    Function to test superiority (greater than) when comparing features
-    '''
-    return float(to_bytes(left)) > float(to_bytes(right))
-
-
-def _gte(left, right):
-    '''
-    Function to test superiority (greater than or equal)
-    when comparing features
-    '''
-    return float(to_bytes(left)) >= float(to_bytes(right))
-
-
-def _lt(left, right):
-    '''
-    Function to test inferiority (greater than) when comparing features
-    '''
-    return float(to_bytes(left)) < float(to_bytes(right))
-
-
-def _lte(left, right):
-    '''
-    Function to test inferiority (greater than or equal)
-    when comparing features
-    '''
-    return float(to_bytes(left)) <= float(to_bytes(right))
-
-
-def _and(left, right):
-    '''
-    Function to test "left and right"
-    '''
-    return left and right
-
-
-def get_alias(operator, left, right):
-    '''
-    Function to translate some virtual operators into real ones
-    '''
-    aliases = {
-        "between": "and(gt(%s),lt(%s))" % (left, right),
-        "between_e": "and(gte(%s),lte(%s))" % (left, right)
-    }
-    for alias in aliases:
-        if alias in operator:
-            return aliases[alias]
-
-
-_REGEXP = re.compile(r'^([^(]+)'          # function name
-                     r'\(\s*([^,]+)'      # first argument
-                     r'(?:\s*,\s*(.+))?'  # remaining optional arguments
-                     r'\)$')              # last parenthesis
-
-
 logger = logging.getLogger('choose_disk')
 
 
-def to_bytes(value):
-    '''
-    Convert storage units into bytes to ease comparison between different units
-    '''
-    value = str(value).lower().strip()
+class InvalidFilter(Exception):
+    pass
 
-    storage_units = {'kb': 1024,
-                     'kib': 1000,
-                     'mb': 1024 * 1024,
-                     'mib': 1000 * 1000,
-                     'gb': 1024 * 1024 * 1024,
-                     'gib': 1000 * 1000 * 1000,
-                     'tb': 1024 * 1024 * 1024 * 1024,
-                     'tib': 1000 * 1000 * 1000 * 1000,
-                     'pb': 1024 * 1024 * 1024 * 1024 * 1024,
-                     'pib': 1000 * 1000 * 1000 * 1000 * 1000}
 
-    # Units are storage units
-    for size in storage_units.keys():
-        if size in value:
-            real_value = value.replace(size, "")
-            return str(float(real_value) * storage_units[size])
+class InvalidQuery(Exception):
+    pass
 
-    return value
+
+class Filter(object):
+    binary_operators = {
+        u"eq": operator.eq,
+
+        u"lt": operator.lt,
+
+        u"gt": operator.gt,
+
+        u"le": operator.le,
+
+        u"ge": operator.ge,
+
+        u"ne": operator.ne,
+
+        u"mod": operator.mod,
+
+        u"add": operator.add,
+
+        u"sub": operator.sub,
+
+        u"mul": operator.mul,
+
+        u"div": operator.truediv,
+
+        u"pow": operator.pow,
+    }
+
+    multiple_operators = {
+        u"or": any,
+        u"and": all,
+    }
+
+    def __init__(self, tree):
+        self._eval = self.build_evaluator(tree)
+
+    def __call__(self, value):
+        return self._eval(value)
+
+    def build_evaluator(self, tree):
+        try:
+            operator, nodes = list(tree.items())[0]
+        except Exception:
+            return lambda value: tree
+        try:
+            op = self.multiple_operators[operator]
+        except KeyError:
+            try:
+                op = self.binary_operators[operator]
+            except KeyError:
+                raise InvalidQuery("Unknown operator %s" % operator)
+            return self._handle_binary_op(op, nodes)
+        return self._handle_multiple_op(op, nodes)
+
+    def _handle_multiple_op(self, op, nodes):
+        elements = [self.build_evaluator(node) for node in nodes]
+        return lambda value: op((e(value) for e in elements))
+
+    def _handle_binary_op(self, op, node):
+        try:
+            iterator = iter(node)
+        except Exception:
+            return lambda value: op(value, node)
+        nodes = list(iterator)
+        if len(nodes) != 2:
+            raise InvalidFilter(
+                "Binary operator %s needs 2 arguments, %d given" %
+                (op, len(nodes)))
+        node0 = self.build_evaluator(node[0])
+        node1 = self.build_evaluator(node[1])
+        return lambda value: op(node0(value), node1(value))
 
 
 def get_keys_by_ceph_order(physical_disks, expected_type):
@@ -165,54 +159,6 @@ def get_keys_by_ceph_order(physical_disks, expected_type):
             non_ceph_disks.append(physical_disk)
 
     return ceph_disks + non_ceph_disks
-
-
-def evaluate_operator(left, right, module=None):
-    '''
-    Evaluate lines splitted in left/right items
-    '''
-
-    # associate a keyword and the associated function
-    OPERATORS = {
-        "=": _equal,
-        "equal": _equal,
-        "gt": _gt,
-        "gte": _gte,
-        "lt": _lt,
-        "lte": _lte,
-        "and": _and,
-    }
-
-    # Default comparing operator is equal
-    operator = "equal"
-
-    # Test if we have another operator in the right operand
-    arguments = _REGEXP.search(right)
-    if arguments:
-        new_operator = arguments.group(1)
-
-        # Some operators are aliases to more complex commands.
-        # Let's make the substition in place and restart with it
-        alias = get_alias(new_operator, arguments.group(2), arguments.group(3))
-        if alias:
-            return evaluate_operator(left, alias, module)
-
-        # Check if the associated function exists
-        if new_operator in OPERATORS:
-            # and assign operands with the new values
-            operator = new_operator
-            right = arguments.group(2)
-            new_arguments = _REGEXP.search(right)
-            if new_arguments:
-                # Don't forget to evaluate the two sides of the expression
-                # Typical case when we shall compare a 'value' with : 'and( gt(x), lt(y) )'
-                # The looking value always stays to the 'left' part of the expression
-                new_right = arguments.group(3)
-                return OPERATORS[operator](evaluate_operator(left, right, module), evaluate_operator(left, new_right, module))  # noqa E501
-                #           and           (                  value,gt(x)        ),                  (value,lt(y)            ) # noqa E501
-        else:
-            fatal("Unsupported '%s' operator in: %s" % (new_operator, right), module)
-    return OPERATORS[operator](left, right)
 
 
 def find_match(physical_disks, lookup_disks, module=None):
@@ -260,16 +206,18 @@ def find_match(physical_disks, lookup_disks, module=None):
                     continue
 
                 # Assign left and right operands
-                right = current_lookup[feature]
-                left = current_physical_disk[feature]
+                # e.g: left is 10.00 GB and right is {'gt': 10}
+                right = current_lookup[feature]  # right is the operand
+                left = current_physical_disk[feature]  # left if the current disk feature
 
                 # Let's check if (left <operator> right) is True meaning the match is done
-                if evaluate_operator(left, right, module):
+                f = Filter(right)
+                if f(left):
                     logger.debug(" %s : match %s %s", physical_disk, left, right)
                     match_count = match_count + 1
                     continue
                 else:
-                    # comparaison is false meaning devices doesn't match
+                    # comparison is False meaning devices don't match
                     logger.debug(" %s : no match %s %s", physical_disk, left, right)
 
             # If all the features matched
@@ -404,7 +352,8 @@ def disk_label(partition, current_fsid, ceph_disk):
                                 return "foreign : {}".format(partition_iter["ceph_fsid"])
 
     # 3) let's search a partition table
-    # if parted returns no partition label this means there is no partition BUT the device is usable
+    # if parted returns no partition label this means there is no partition
+    # BUT the device is usable
     # however if parted fails with something else then we return failed
     parted_stdout = subprocess.Popen(
         ["parted", "-sm", "{}".format(partition), "print"], stderr=subprocess.PIPE, stdout=open(os.devnull, 'w'))
@@ -470,9 +419,9 @@ def select_only_free_devices(physical_disks, current_fsid):
             logger.info('Ignoring %10s : device does not support partitioning', physical_disk)
             continue
 
-        # Removing Cdrom Devices
+        # Removing CD-ROM Devices
         if physical_disk.startswith("sr") or physical_disk.startswith("cdrom"):
-            logger.info('Ignoring %10s : cdrom device', physical_disk)
+            logger.info('Ignoring %10s : CD-ROM device', physical_disk)
             continue
 
         # Removing Read-only devices
@@ -486,7 +435,7 @@ def select_only_free_devices(physical_disks, current_fsid):
         # It's up to the admin to zap the device before using it in ceph-ansible
         # There is only an exception :
         #    if the partitions are from ceph, it surely means that we have to
-        #    reuse them to get a match on an exisiting setup
+        #    reuse them to get a match on an existing setup
         # This is mandatory to inform ansible we found the proper configuration
         found_populated_partition = False
         if len(current_physical_disk['partitions']) > 0:
@@ -530,7 +479,7 @@ def select_only_free_devices(physical_disks, current_fsid):
                                           stdout=subprocess.PIPE)
             raw_pvdisplay, _ = output_cmd.communicate()
             if output_cmd.returncode == 0:
-                # FIXME: Why not considering if there is some free space on it ?
+                # FIXME: Why not considering if there is some free space on it?
                 logger.info('Ignoring %10s : device is already used by LVM', physical_disk)
                 continue
         elif disk_type.startswith("foreign"):
@@ -734,7 +683,7 @@ def main():
         fatal("Could only find %d of the %d expected devices" % (len(matched_devices),
                                                                  len(lookup_disks)), module)
 
-    # Preparing the final output by deivces in several categories
+    # Preparing the final output by device in several categories
     # This is CEPH_META_LIST + ceph_already_configured to report the already configured devices
     ceph_data = []
     ceph_journal = []
